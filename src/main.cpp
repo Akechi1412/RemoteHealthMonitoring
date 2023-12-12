@@ -11,11 +11,13 @@
 #include "PubSubClient.h"
 #include "ArduinoJson.h"
 #include "WiFiManager.h"
+#include "ESP32Time.h"
 
+#define   SERIAL_NUMBER                 "RHM1129010102"
 #define   MAX30102_USE_FIFO
 #define   MAX30102_FINGER_ON        30000   // If red signal is lower than this, it indicates your finger is not on the sensor
 #define   MAX30102_RATE_SIZE        4       // Increase this for more averaging. 4 is good.
-#define   DS18B20_GPIO              25      // GPIO where the DS18B20 is connected to
+#define   DS18B20_GPIO              32      // GPIO where the DS18B20 is connected to
 #define   DS18B20_DELAY             3000    // DS18B20 time delay 
 #define   SCREEN_WIDTH              128
 #define   SCREEN_HEIGHT             64
@@ -25,17 +27,15 @@
 #define   OLED_CS                   5
 #define   OLED_RESET                17
 #define   AD8232_ADC                33
-#define   AD8232_L1                 27
-#define   AD8232_L2                 14
-#define   ECG_SAMPLING_RATE         5
-#define   ECG_BLOCK_LENGTH          200
+#define   AD8232_L1                 25
+#define   AD8232_L2                 26
+#define   ECG_SAMPLING_RATE         4
+#define   ECG_BLOCK_LENGTH          25
 #define   NORMAL_HUMAN_TEMP         35.5
-#define   AWS_SUBSCRIBE_TOPIC1      "max30102/sub"
-#define   AWS_SUBSCRIBE_TOPIC2      "ds18b20/sub"
-#define   AWS_SUBSCRIBE_TOPIC3      "ad8232/sub"
-#define   AWS_PUBLISH_TOPIC1        "max30102/pub"
-#define   AWS_PUBLISH_TOPIC2        "ds18b20/pub"
-#define   AWS_PUBLISH_TOPIC3        "ad8232/pub"
+#define   AWS_SUBSCRIBE_TOPIC       "RHM/sub"
+#define   AWS_PUBLISH_TOPIC1        "RHM/max30102/pub"
+#define   AWS_PUBLISH_TOPIC2        "RHM/ds18b20/pub"
+#define   AWS_PUBLISH_TOPIC3        "RHM/ad8232/pub"
 
 enum dataType_t { MAX30102, DS18B20, AD8232 };
 
@@ -49,9 +49,13 @@ typedef struct {
   float temperature;
   uint16_t ecgBlock[ECG_BLOCK_LENGTH]; 
   dataType_t dataType;
+  uint64_t timestamp;
 } data_t;
 
 // Global variable
+const char* ntpServer = "pool.ntp.org";
+ESP32Time rtc(25200);  // Offset in seconds GMT+7
+uint64_t sessionId = 0;
 QueueHandle_t queueHandle;
 const int queueElementSize = 10;
 float ambianceTemp = 0;
@@ -67,9 +71,10 @@ void readAD8232SensorTask(void *pvParamters);
 void vReceiverTask(void *pvParameters);
 void messageHandler(char* topic, byte* payload, unsigned int length);
 void connectAWS();
+uint64_t getTimestamp();
 void publishMAX30102Data(int heartRate, float spo2);
 void publishDS18B20Data(float temperature);
-void publishAD82832Data(uint16_t ecgBlock[], size_t size);
+void publishAD82832Data(uint16_t ecgBlock[], size_t size, uint64_t timestamp);
 
 void setup()
 {
@@ -150,6 +155,22 @@ void setup()
       delay(1000); // Halt at this point as is not possible to continue
     }
   }
+
+  // Setup ESP32Time with NTP
+  configTime(0, 0, ntpServer);
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo))
+  {
+    rtc.setTimeStruct(timeinfo); 
+  }
+  else 
+  {
+    Serial.println("Failed to obtain time");
+  }
+
+  // Create Sesion Id
+  sessionId = getTimestamp();
+  Serial.printf("Session ID: %llu\n", sessionId);
 }
 
 void loop()
@@ -319,7 +340,7 @@ void readAD8232SensorTask(void *pvParamters)
 {
   portTickType    xLastWakeTime;
   xLastWakeTime = xTaskGetTickCount();
-
+  randomSeed(analogRead(0));    // just for testigng
   data_t data;
   int i = 0, j = 0;
 
@@ -328,27 +349,28 @@ void readAD8232SensorTask(void *pvParamters)
 
   while(1)
   {
-    if((digitalRead(AD8232_L2) == 1) || (digitalRead(AD8232_L1) == 1))
-    {
-      // Serial.println("AD8232: No detected!");
-      j++;
-      if (j >= ECG_BLOCK_LENGTH)
-      {
-        j = 0;
-        i = 0;
-      }
-    }
-    else
-    {
-      data.ecgBlock[i] = analogRead(AD8232_ADC);
-      i++;
-    }
+    // if((digitalRead(AD8232_L2) == 1) || (digitalRead(AD8232_L1) == 1))
+    // {
+    //   // Serial.println("AD8232: No detected!");
+    //   j++;
+    //   if (j == ECG_BLOCK_LENGTH * 2)
+    //   {
+    //     j = 0;
+    //     i = 0;
+    //   }
+    //   continue;
+    // }
 
+    // data.ecgBlock[i] = analogRead(AD8232_ADC);
+    data.ecgBlock[i] = random(0, 4000); // just for testing
+    i++;
     if (i == ECG_BLOCK_LENGTH)
     {
       i = 0;
       j = 0;
       data.dataType = AD8232;
+      data.timestamp = getTimestamp();
+      Serial.printf("%llu\n", data.timestamp);
       BaseType_t returnValue = xQueueSend(queueHandle, (void*)&data, portMAX_DELAY);
       if(returnValue == errQUEUE_FULL)
       {
@@ -409,7 +431,7 @@ void vReceiverTask(void *pvParameters)
 
       case AD8232:
         ecgDetected = true;
-        publishAD82832Data(data.ecgBlock, ECG_BLOCK_LENGTH);
+        publishAD82832Data(data.ecgBlock, ECG_BLOCK_LENGTH, data.timestamp);
         break;
         
       default:
@@ -528,16 +550,21 @@ void connectAWS()
   }
  
   // Subscribe to a topic
-  client.subscribe(AWS_SUBSCRIBE_TOPIC1);
-  client.subscribe(AWS_SUBSCRIBE_TOPIC2);
-  client.subscribe(AWS_SUBSCRIBE_TOPIC3);
- 
+  client.subscribe(AWS_SUBSCRIBE_TOPIC);
+
   Serial.println("AWS IoT Connected!");
+}
+
+uint64_t getTimestamp() 
+{
+  return (uint64_t)rtc.getEpoch() * 1000 + rtc.getMillis();
 }
 
 void publishMAX30102Data(int heartRate, float spo2)
 {
   StaticJsonDocument<200> doc;
+  doc["serialNumber"] = SERIAL_NUMBER;
+  doc["sessionId"] = sessionId;
   doc["heartRate"] = heartRate;
   doc["spo2"] = spo2;
   char jsonBuffer[512];
@@ -549,6 +576,8 @@ void publishMAX30102Data(int heartRate, float spo2)
 void publishDS18B20Data(float temperature)
 {
   StaticJsonDocument<200> doc;
+  doc["serialNumber"] = SERIAL_NUMBER;
+  doc["sessionId"] = sessionId;
   doc["temperature"] = temperature;
   char jsonBuffer[512];
   serializeJson(doc, jsonBuffer);
@@ -556,17 +585,20 @@ void publishDS18B20Data(float temperature)
   client.publish(AWS_PUBLISH_TOPIC2, jsonBuffer);
 }
 
-void publishAD82832Data(uint16_t ecgBlock[], size_t size)
+void publishAD82832Data(uint16_t ecgBlock[], size_t size, uint64_t timestamp)
 {
-  StaticJsonDocument<200> doc;
+  StaticJsonDocument<500> doc;
+  doc["serialNumber"] = SERIAL_NUMBER;
+  doc["sessionId"] = sessionId;
+  doc["timestamp"] = timestamp;
   JsonArray ecgArray = doc.createNestedArray("ecgBlock");
   
   for (size_t i = 0; i < size; i++) {
     ecgArray.add(ecgBlock[i]);
   }
   
-  char jsonBuffer[10240];
+  char jsonBuffer[512];
   serializeJson(doc, jsonBuffer);
- 
-  client.publish(AWS_PUBLISH_TOPIC3, jsonBuffer);
+  Serial.println(jsonBuffer);
+  // client.publish(AWS_PUBLISH_TOPIC3, jsonBuffer);
 }
