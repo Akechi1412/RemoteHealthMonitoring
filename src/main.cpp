@@ -13,14 +13,14 @@
 #include "WiFiManager.h"
 #include "ESP32Time.h"
 
-#define   SERIAL_NUMBER                 "RHM1129010102"
+#define   SERIAL_NUMBER             "RHM1129010102"
 #define   MAX30102_USE_FIFO
 #define   MAX30102_FINGER_ON        30000   // If red signal is lower than this, it indicates your finger is not on the sensor
 #define   MAX30102_RATE_SIZE        4       // Increase this for more averaging. 4 is good.
 #define   DS18B20_GPIO              32      // GPIO where the DS18B20 is connected to
-#define   DS18B20_DELAY             3000    // DS18B20 time delay 
-#define   SCREEN_WIDTH              128
-#define   SCREEN_HEIGHT             64
+#define   DS18B20_DELAY             4000    // DS18B20 time delay 
+#define   SCREEN_WIDTH              128     // OLED screen width
+#define   SCREEN_HEIGHT             64      // OLED screen height
 #define   OLED_MOSI                 23
 #define   OLED_CLK                  18
 #define   OLED_DC                   16
@@ -32,7 +32,8 @@
 #define   ECG_SAMPLING_RATE         4
 #define   ECG_BLOCK_LENGTH          25
 #define   NORMAL_HUMAN_TEMP         35.5
-#define   AWS_SUBSCRIBE_TOPIC       "RHM/sub"
+#define   AWS_SUBSCRIBE_TOPIC       (SERIAL_NUMBER "/sub")
+#define   AWS_PUBLISH_TOPIC         "RHM/pub"
 #define   AWS_PUBLISH_TOPIC1        "RHM/max30102/pub"
 #define   AWS_PUBLISH_TOPIC2        "RHM/ds18b20/pub"
 #define   AWS_PUBLISH_TOPIC3        "RHM/ad8232/pub"
@@ -53,12 +54,12 @@ typedef struct {
 } data_t;
 
 // Global variable
+bool isDeviceActivated = false;
 const char* ntpServer = "pool.ntp.org";
 ESP32Time rtc(25200);  // Offset in seconds GMT+7
 uint64_t sessionId = 0;
 QueueHandle_t queueHandle;
 const int queueElementSize = 10;
-float ambianceTemp = 0;
 Adafruit_SSD1306 ssd1306(SCREEN_WIDTH, SCREEN_HEIGHT,
     OLED_MOSI, OLED_CLK, OLED_DC, OLED_RESET, OLED_CS);
 WiFiClientSecure net = WiFiClientSecure();
@@ -72,8 +73,8 @@ void vReceiverTask(void *pvParameters);
 void messageHandler(char* topic, byte* payload, unsigned int length);
 void connectAWS();
 uint64_t getTimestamp();
-void publishMAX30102Data(int heartRate, float spo2);
-void publishDS18B20Data(float temperature);
+void publishMAX30102Data(int heartRate, float spo2, uint64_t timestamp);
+void publishDS18B20Data(float temperature, uint64_t timestamp);
 void publishAD82832Data(uint16_t ecgBlock[], size_t size, uint64_t timestamp);
 
 void setup()
@@ -87,23 +88,24 @@ void setup()
   }
   
   ssd1306.clearDisplay();
-  ssd1306.display();
-  delay(1000);
-  ssd1306.clearDisplay();
   ssd1306.setTextSize(2);
   ssd1306.setTextColor(SSD1306_WHITE);
   ssd1306.setCursor(3, 3);
   ssd1306.printf("  Remote\n  Health\nMonitoring");
   ssd1306.display();
   delay(4000);
-  ssd1306.clearDisplay();
-  ssd1306.setCursor(3, 14);
-  ssd1306.print("Connecting...");
-  ssd1306.display();
 
   connectAWS();
+  delay(2000);
 
-  ssd1306.clearDisplay();
+  while(!isDeviceActivated)
+  {
+    ssd1306.clearDisplay();
+    ssd1306.setCursor(2, 10);
+    ssd1306.printf("The device\n  is not\n activated");
+    ssd1306.display();
+    client.loop();
+  }
 
   xTaskCreatePinnedToCore(
     readMAX30102SensorTask
@@ -248,9 +250,9 @@ void readMAX30102SensorTask(void *pvParameters)
     }
 
 #ifdef MAX30102_USE_FIFO
-    particleSensor.check(); // Check the sensor, read up to 3 samples
+    particleSensor.check();
 
-    while (particleSensor.available()) // Do we have new data 
+    while (particleSensor.available())
     {
 #ifdef MAX30105
     red = particleSensor.getFIFORed(); // Sparkfun's MAX30105
@@ -268,16 +270,12 @@ void readMAX30102SensorTask(void *pvParameters)
       sumIrRms += (dIr - averageIr) * (dIr - averageIr);
 
       if ((i % SPO2_SAMPLING) == 0) {
-        ambianceTemp = particleSensor.readTemperature();
-
         double R = (sqrt(sumRedRms) / averageRed) / (sqrt(sumIrRms) / averageIr);
-        // Serial.println(R);
-        spo2 = -23.3 * (R - 0.4) + 100; // http://ww1.microchip.com/downloads/jp/AppNotes/00001525B_JP.pdf -- I don't see this directly in the App Note... look here https://github.com/espressif/arduino-esp32/issues/4561
+        spo2 = -23.3 * (R - 0.4) + 100;
         estimatedSpo2 = SPO2_FILTER_FACTOR * estimatedSpo2 + (1.0 - SPO2_FILTER_FACTOR) * spo2; // Low pass filter
         
         if (ir < MAX30102_FINGER_ON) // No finger on the sensor
         {
-          // Serial.println("No finger detected");
           break;
         }
         else if(ir > MAX30102_FINGER_ON)
@@ -285,6 +283,7 @@ void readMAX30102SensorTask(void *pvParameters)
           data.max30102Data.heartRate = averageBeat;
           data.max30102Data.spo2 = estimatedSpo2;
           data.dataType = MAX30102;
+          data.timestamp = getTimestamp();
           BaseType_t returnValue = xQueueSend(queueHandle, (void*)&data, 0);
           if(returnValue == errQUEUE_FULL)
           {
@@ -319,13 +318,13 @@ void readDS18B20SensorTask(void *pvParameters)
 
  while(1)
   {
-    // Serial.printf("Ambiance Temp: %f\n", ambianceTemp);
     ds18b20.requestTemperatures(); 
-    float temperatureC = ds18b20.getTempCByIndex(0) + 0.5;
+    float temperatureC = ds18b20.getTempCByIndex(0);
     if (temperatureC != DEVICE_DISCONNECTED_C) 
     {
       data.temperature = temperatureC;
       data.dataType = DS18B20;
+      data.timestamp = getTimestamp();
       BaseType_t returnValue = xQueueSend(queueHandle, (void*)&data, portMAX_DELAY);
       if(returnValue == errQUEUE_FULL)
       {
@@ -340,37 +339,30 @@ void readAD8232SensorTask(void *pvParamters)
 {
   portTickType    xLastWakeTime;
   xLastWakeTime = xTaskGetTickCount();
-  randomSeed(analogRead(0));    // just for testigng
   data_t data;
-  int i = 0, j = 0;
+  int i = 0;
 
   pinMode(AD8232_L2, INPUT); // Setup for leads off detection LO +
   pinMode(AD8232_L1, INPUT); // Setup for leads off detection LO -
 
+  delay(5000);
+
   while(1)
   {
-    // if((digitalRead(AD8232_L2) == 1) || (digitalRead(AD8232_L1) == 1))
-    // {
-    //   // Serial.println("AD8232: No detected!");
-    //   j++;
-    //   if (j == ECG_BLOCK_LENGTH * 2)
-    //   {
-    //     j = 0;
-    //     i = 0;
-    //   }
-    //   continue;
-    // }
+    if((digitalRead(AD8232_L2) == 1) || (digitalRead(AD8232_L1) == 1))
+    {
+      Serial.println("Not Detected");
+      continue;
+    }
 
-    // data.ecgBlock[i] = analogRead(AD8232_ADC);
-    data.ecgBlock[i] = random(0, 4000); // just for testing
+    data.ecgBlock[i] = analogReadMilliVolts(AD8232_ADC);
     i++;
     if (i == ECG_BLOCK_LENGTH)
     {
       i = 0;
-      j = 0;
       data.dataType = AD8232;
       data.timestamp = getTimestamp();
-      Serial.printf("%llu\n", data.timestamp);
+
       BaseType_t returnValue = xQueueSend(queueHandle, (void*)&data, portMAX_DELAY);
       if(returnValue == errQUEUE_FULL)
       {
@@ -407,25 +399,14 @@ void vReceiverTask(void *pvParameters)
       case MAX30102:
         heartRate = data.max30102Data.heartRate;
         spo2 = data.max30102Data.spo2;
-        publishMAX30102Data(heartRate, spo2);
-        Serial.print("Heart Rate = ");
-        Serial.print(heartRate);
-        Serial.print(",Oxygen % = ");
-        Serial.print(spo2);
-        Serial.println("%");
+        publishMAX30102Data(heartRate, spo2, data.timestamp);
         break;
 
       case DS18B20:
-        if (ambianceTemp == 0)
-          break;
-        if (data.temperature > ambianceTemp || data.temperature >= NORMAL_HUMAN_TEMP)
+        if (data.temperature >= NORMAL_HUMAN_TEMP)
         {
-          if (data.temperature > temperature)
-          {
-            temperature = data.temperature;
-            publishDS18B20Data(temperature);
-            // Serial.printf("Temperature: %.1f ºC\n", temperature);
-          }
+          temperature = data.temperature;
+          publishDS18B20Data(temperature, data.timestamp);
         }
         break;
 
@@ -503,12 +484,19 @@ void messageHandler(char* topic, byte* payload, unsigned int length)
   StaticJsonDocument<200> doc;
   deserializeJson(doc, payload);
   const char* message = doc["message"];
-  Serial.println(message);
+  Serial.printf("message: %s\n", message);
+  if (strcmp(message, "Activated") == 0)
+  {
+    isDeviceActivated = true;
+  }
 }
 
 void connectAWS()
 {
-  Serial.println("Connecting to Wi-Fi");
+  ssd1306.clearDisplay();
+  ssd1306.setCursor(2, 10);
+  ssd1306.printf("Connecting\n  to WiFi\n    ...");
+  ssd1306.display();
 
   WiFi.mode(WIFI_STA); 
   WiFiManager wm;
@@ -517,11 +505,18 @@ void connectAWS()
   res = wm.autoConnect("RemoteHealthMonitoringAP", "password");
 
   if(!res) {
-      Serial.println("Failed to connect");
-      // ESP.restart();
+    // ESP.restart();
+    ssd1306.clearDisplay();
+    ssd1306.setCursor(2, 10);
+    ssd1306.printf("Failed to\n  WiFi\nconnection");
+    ssd1306.display();
+    while(1);
   } 
   else {   
-      Serial.println("Wifi connected");
+    ssd1306.clearDisplay();
+    ssd1306.setCursor(8, 14);
+    ssd1306.printf("   WiFi\n connected");
+    ssd1306.display();
   }
  
   // Configure WiFiClientSecure to use the AWS IoT device credentials
@@ -534,25 +529,38 @@ void connectAWS()
  
   // Create a message handler
   client.setCallback(messageHandler);
- 
-  Serial.println("Connecting to AWS IOT");
- 
+
   while (!client.connect(THINGNAME))
   {
-    Serial.print(".");
-    delay(100);
+    ssd1306.clearDisplay();
+    ssd1306.setCursor(4, 14);
+    ssd1306.printf("Connecting\nto AWS...");
+    ssd1306.display();
   }
  
   if (!client.connected())
   {
-    Serial.println("AWS IoT Timeout!");
-    return;
+    ssd1306.clearDisplay();
+    ssd1306.setCursor(2, 10);
+    ssd1306.printf("   AWS\nconnection\n  timeout");
+    ssd1306.display();
+    while(1);
   }
- 
-  // Subscribe to a topic
+
+  // Subscribe a topic
   client.subscribe(AWS_SUBSCRIBE_TOPIC);
 
-  Serial.println("AWS IoT Connected!");
+  // Publish a topic
+  StaticJsonDocument<200> doc;
+  doc["serialNumber"] = SERIAL_NUMBER;
+  char jsonBuffer[128];
+  serializeJson(doc, jsonBuffer);
+  client.publish(AWS_PUBLISH_TOPIC, jsonBuffer);
+
+  ssd1306.clearDisplay();
+  ssd1306.setCursor(8, 14);
+  ssd1306.print("   AWS\n connected");
+  ssd1306.display();
 }
 
 uint64_t getTimestamp() 
@@ -560,11 +568,12 @@ uint64_t getTimestamp()
   return (uint64_t)rtc.getEpoch() * 1000 + rtc.getMillis();
 }
 
-void publishMAX30102Data(int heartRate, float spo2)
+void publishMAX30102Data(int heartRate, float spo2, uint64_t timestamp)
 {
   StaticJsonDocument<200> doc;
   doc["serialNumber"] = SERIAL_NUMBER;
   doc["sessionId"] = sessionId;
+  doc["timestamp"] = timestamp;
   doc["heartRate"] = heartRate;
   doc["spo2"] = spo2;
   char jsonBuffer[512];
@@ -573,11 +582,12 @@ void publishMAX30102Data(int heartRate, float spo2)
   client.publish(AWS_PUBLISH_TOPIC1, jsonBuffer);
 }
 
-void publishDS18B20Data(float temperature)
+void publishDS18B20Data(float temperature, uint64_t timestamp)
 {
   StaticJsonDocument<200> doc;
   doc["serialNumber"] = SERIAL_NUMBER;
   doc["sessionId"] = sessionId;
+  doc["timestamp"] = timestamp;
   doc["temperature"] = temperature;
   char jsonBuffer[512];
   serializeJson(doc, jsonBuffer);
@@ -599,6 +609,6 @@ void publishAD82832Data(uint16_t ecgBlock[], size_t size, uint64_t timestamp)
   
   char jsonBuffer[512];
   serializeJson(doc, jsonBuffer);
-  Serial.println(jsonBuffer);
-  // client.publish(AWS_PUBLISH_TOPIC3, jsonBuffer);
+
+  client.publish(AWS_PUBLISH_TOPIC3, jsonBuffer);
 }
