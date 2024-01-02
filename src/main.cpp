@@ -230,7 +230,6 @@ void readMAX30102SensorTask(void *pvParameters)
     //Calculate BPM independent of Maxim Algorithm. 
     if (checkForBeat(irRecent) == true)
     {
-      //We sensed a beat!
       long delta = millis() - lastBeat;
       lastBeat = millis();
 
@@ -261,6 +260,11 @@ void readMAX30102SensorTask(void *pvParameters)
     red = particleSensor.getFIFOIR();  // Why getFIFOIR output Red data by MAX30102 on MH-ET LIVE breakout board
     ir  = particleSensor.getFIFORed(); // Why getFIFORed output IR data by MAX30102 on MH-ET LIVE breakout board
 #endif
+      if (ir < MAX30102_FINGER_ON) // No finger on the sensor
+      {
+        break;
+      }
+
       i++;
       dRed = (double)red;
       dIr  = (double)ir;
@@ -274,22 +278,15 @@ void readMAX30102SensorTask(void *pvParameters)
         spo2 = -23.3 * (R - 0.4) + 100;
         estimatedSpo2 = SPO2_FILTER_FACTOR * estimatedSpo2 + (1.0 - SPO2_FILTER_FACTOR) * spo2; // Low pass filter
         
-        if (ir < MAX30102_FINGER_ON) // No finger on the sensor
+        data.max30102Data.heartRate = averageBeat;
+        data.max30102Data.spo2 = estimatedSpo2;
+        data.dataType = MAX30102;
+        data.timestamp = getTimestamp();
+        BaseType_t returnValue = xQueueSend(queueHandle, (void*)&data, 0);
+        if(returnValue == errQUEUE_FULL)
         {
-          break;
-        }
-        else if(ir > MAX30102_FINGER_ON)
-        {
-          data.max30102Data.heartRate = averageBeat;
-          data.max30102Data.spo2 = estimatedSpo2;
-          data.dataType = MAX30102;
-          data.timestamp = getTimestamp();
-          BaseType_t returnValue = xQueueSend(queueHandle, (void*)&data, 0);
-          if(returnValue == errQUEUE_FULL)
-          {
-            Serial.println("The `readMAX30102SensorTask` was unable to send data into the Queue");
-          } 
-        }
+          Serial.println("The `readMAX30102SensorTask` was unable to send data into the Queue");
+        } 
 
         sumRedRms = 0.0; 
         sumIrRms = 0.0; 
