@@ -319,7 +319,7 @@ void readDS18B20SensorTask(void *pvParameters)
  while(1)
   {
     ds18b20.requestTemperatures(); 
-    float temperatureC = ds18b20.getTempCByIndex(0);
+    float temperatureC = ds18b20.getTempCByIndex(0) + 0.5;
     if (temperatureC != DEVICE_DISCONNECTED_C) 
     {
       data.temperature = temperatureC;
@@ -352,22 +352,23 @@ void readAD8232SensorTask(void *pvParamters)
     if((digitalRead(AD8232_L2) == 1) || (digitalRead(AD8232_L1) == 1))
     {
       Serial.println("Not Detected");
-      continue;
     }
-
-    data.ecgBlock[i] = analogReadMilliVolts(AD8232_ADC);
-    i++;
-    if (i == ECG_BLOCK_LENGTH)
+    else 
     {
-      i = 0;
-      data.dataType = AD8232;
-      data.timestamp = getTimestamp();
-
-      BaseType_t returnValue = xQueueSend(queueHandle, (void*)&data, portMAX_DELAY);
-      if(returnValue == errQUEUE_FULL)
+      data.ecgBlock[i] = analogRead(AD8232_ADC);
+      i++;
+      if (i == ECG_BLOCK_LENGTH)
       {
-        Serial.println("The `readAD8232SensorTask` was unable to send data into the Queue");
-      } 
+        i = 0;
+        data.dataType = AD8232;
+        data.timestamp = getTimestamp();
+
+        BaseType_t returnValue = xQueueSend(queueHandle, (void*)&data, portMAX_DELAY);
+        if(returnValue == errQUEUE_FULL)
+        {
+          Serial.println("The `readAD8232SensorTask` was unable to send data into the Queue");
+        } 
+      }
     }
 
     xTaskDelayUntil(&xLastWakeTime, ECG_SAMPLING_RATE / portTICK_PERIOD_MS);
@@ -505,7 +506,7 @@ void connectAWS()
   res = wm.autoConnect("RemoteHealthMonitoringAP", "password");
 
   if(!res) {
-    // ESP.restart();
+    ESP.restart();
     ssd1306.clearDisplay();
     ssd1306.setCursor(2, 10);
     ssd1306.printf("Failed to\n  WiFi\nconnection");
